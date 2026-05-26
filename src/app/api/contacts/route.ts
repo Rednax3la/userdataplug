@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import type { ContactsQueryParams } from "@/types";
+import type { Contact, ContactsQueryParams } from "@/types";
 
 export async function GET(req: NextRequest) {
   const supabase = await createClient();
@@ -16,7 +16,7 @@ export async function GET(req: NextRequest) {
     country: sp.get("country") ?? undefined,
     gender: sp.get("gender") ?? undefined,
     min_confidence: sp.get("min_confidence") ? parseFloat(sp.get("min_confidence")!) : undefined,
-    sort_by: (sp.get("sort_by") as keyof import("@/types").Contact) ?? "created_at",
+    sort_by: (sp.get("sort_by") as keyof Contact) ?? "created_at",
     sort_dir: (sp.get("sort_dir") as "asc" | "desc") ?? "desc",
   };
 

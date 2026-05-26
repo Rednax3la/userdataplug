@@ -123,15 +123,13 @@ export function mergeContacts(
     const sVal = secondary[field];
 
     if (!pVal && sVal) {
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (merged as any)[field] = sVal;
+      (merged as Record<string, unknown>)[field] = sVal;
       if (secondary.primary_source_id) {
         fieldSources[field] = secondary.primary_source_id;
       }
     } else if (pVal && sVal && secondaryScore > primaryScore) {
       // Secondary has higher confidence — prefer its value
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (merged as any)[field] = sVal;
+      (merged as Record<string, unknown>)[field] = sVal;
       if (secondary.primary_source_id) {
         fieldSources[field] = secondary.primary_source_id;
       }

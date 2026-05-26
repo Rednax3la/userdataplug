@@ -87,7 +87,8 @@ export async function GET(req: NextRequest) {
 
   if (format === "xlsx") {
     // Import xlsx dynamically (server-side only)
-    const XLSX = await import("xlsx");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const XLSX = require("xlsx") as typeof import("xlsx");
 
     const wb = XLSX.utils.book_new();
 

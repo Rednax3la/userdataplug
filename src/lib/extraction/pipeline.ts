@@ -195,7 +195,8 @@ export async function parsePDF(buffer: ArrayBuffer): Promise<ExtractedEntity[]> 
   const entities: ExtractedEntity[] = [];
   try {
     // Dynamic import — pdf-parse is a heavy module
-    const pdfParse = (await import("pdf-parse")).default;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const pdfParse = require("pdf-parse") as (input: Buffer) => Promise<{ text: string; numpages: number }>;
     const data = await pdfParse(Buffer.from(buffer));
     const text = data.text ?? "";
 
@@ -219,7 +220,8 @@ export async function parsePDF(buffer: ArrayBuffer): Promise<ExtractedEntity[]> 
 export async function parseExcel(buffer: ArrayBuffer): Promise<ExtractedEntity[]> {
   const entities: ExtractedEntity[] = [];
   try {
-    const XLSX = await import("xlsx");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const XLSX = require("xlsx") as typeof import("xlsx");
     const wb = XLSX.read(Buffer.from(buffer), { type: "buffer" });
 
     for (const sheetName of wb.SheetNames) {
@@ -241,7 +243,8 @@ export async function parseExcel(buffer: ArrayBuffer): Promise<ExtractedEntity[]
 export async function parseCSV(buffer: ArrayBuffer): Promise<ExtractedEntity[]> {
   const entities: ExtractedEntity[] = [];
   try {
-    const Papa = (await import("papaparse")).default;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const Papa = require("papaparse") as typeof import("papaparse");
     const text = new TextDecoder("utf-8").decode(buffer);
     const result = Papa.parse<string[]>(text, {
       header: false,
@@ -259,7 +262,8 @@ export async function parseCSV(buffer: ArrayBuffer): Promise<ExtractedEntity[]> 
 export async function parseDOCX(buffer: ArrayBuffer): Promise<ExtractedEntity[]> {
   const entities: ExtractedEntity[] = [];
   try {
-    const mammoth = await import("mammoth");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mammoth = require("mammoth") as { extractRawText: (opts: { buffer: Buffer }) => Promise<{ value: string }> };
     const result = await mammoth.extractRawText({ buffer: Buffer.from(buffer) });
     const text = result.value ?? "";
     entities.push(...extractFromText(text));
@@ -302,7 +306,8 @@ export async function aiExtract(
   const entities: ExtractedEntity[] = [];
 
   try {
-    const Anthropic = (await import("@anthropic-ai/sdk")).default;
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const client = new Anthropic({ apiKey });
 
     for (const chunk of textChunks) {
@@ -437,7 +442,8 @@ export async function runExtractionPipeline(
   // run AI on text that yielded nothing
   if (raw.length === 0 && anthropicApiKey && ext === "pdf") {
     try {
-      const pdfParse = (await import("pdf-parse")).default;
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const pdfParse = require("pdf-parse") as (input: Buffer) => Promise<{ text: string }>;
       const data = await pdfParse(Buffer.from(buffer));
       const text = data.text ?? "";
       const chunks = chunkText(text, 6000);
