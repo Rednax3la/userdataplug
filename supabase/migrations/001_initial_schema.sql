@@ -187,17 +187,25 @@ create policy "uploads_insert" on uploads for insert to authenticated with check
 create policy "uploads_update" on uploads for update to authenticated using (auth.uid() = user_id);
 
 -- Source documents: all authenticated users can read/write
-create policy "source_docs_all" on source_documents for all to authenticated using (true) with check (true);
+create policy "source_docs_select" on source_documents for select to authenticated using (true);
+create policy "source_docs_insert" on source_documents for insert to authenticated with check (true);
+create policy "source_docs_update" on source_documents for update to authenticated using (true) with check (true);
+create policy "source_docs_delete" on source_documents for delete to authenticated using (true);
 
 -- Contacts: shared across org
-create policy "contacts_all" on contacts for all to authenticated using (true) with check (true);
+create policy "contacts_select" on contacts for select to authenticated using (true);
+create policy "contacts_insert" on contacts for insert to authenticated with check (true);
+create policy "contacts_update" on contacts for update to authenticated using (true) with check (true);
+create policy "contacts_delete" on contacts for delete to authenticated using (true);
 
 -- Duplicate candidates: shared
-create policy "dup_all" on duplicate_candidates for all to authenticated using (true) with check (true);
+create policy "dup_select" on duplicate_candidates for select to authenticated using (true);
+create policy "dup_insert" on duplicate_candidates for insert to authenticated with check (true);
+create policy "dup_update" on duplicate_candidates for update to authenticated using (true) with check (true);
 
--- Processing logs: read-only for users, write via service role
+-- Processing logs
 create policy "logs_select" on processing_logs for select to authenticated using (true);
-create policy "logs_insert" on processing_logs for insert to authenticated using (true) with check (true);
+create policy "logs_insert" on processing_logs for insert to authenticated with check (true);
 
 -- ============================================================
 -- STORAGE BUCKET
