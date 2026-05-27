@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
 import { runExtractionPipeline } from "@/lib/extraction/pipeline";
-import { findDuplicates } from "@/lib/extraction/deduplicator";
+import { findDuplicates, mergeContacts } from "@/lib/extraction/deduplicator";
 import type { Contact } from "@/types";
 
 // Vercel: allow up to 60s for extraction
@@ -91,7 +91,6 @@ export async function POST(req: NextRequest) {
     const dupPairs: { a: string; b: string; score: number; reasons: string[] }[] = [];
 
     for (const contact of normalizedContacts) {
-      // Find duplicates before inserting
       const matches = findDuplicates(
         {
           email: contact.email ?? undefined,
@@ -105,9 +104,28 @@ export async function POST(req: NextRequest) {
         existing
       );
 
+      const topMatch = matches[0];
+
+      // HIGH confidence (≥0.9, e.g. exact email/phone): auto-merge into existing record
+      if (topMatch && topMatch.score >= 0.9) {
+        const existingContact = existing.find((c) => c.id === topMatch.contact_id);
+        if (existingContact) {
+          const merged = mergeContacts(existingContact, contact as Contact);
+          await service
+            .from("contacts")
+            .update(merged)
+            .eq("id", existingContact.id);
+          // Update local cache
+          Object.assign(existingContact, merged);
+          inserted++; // count as processed
+          continue;
+        }
+      }
+
       const contactToInsert = { ...contact };
 
-      if (matches.length > 0 && matches[0].score >= 0.85) {
+      // MEDIUM confidence (0.7–0.9): insert but flag for manual review
+      if (topMatch && topMatch.score >= 0.7) {
         contactToInsert.is_flagged = true;
         contactToInsert.flags = [...(contactToInsert.flags ?? []), "potential_duplicate"];
       }
@@ -121,12 +139,12 @@ export async function POST(req: NextRequest) {
       if (insertErr || !newContact) continue;
       inserted++;
 
-      if (matches.length > 0 && matches[0].score >= 0.85) {
+      if (topMatch && topMatch.score >= 0.7) {
         dupPairs.push({
-          a: matches[0].contact_id,
+          a: topMatch.contact_id,
           b: newContact.id,
-          score: matches[0].score,
-          reasons: matches[0].reasons,
+          score: topMatch.score,
+          reasons: topMatch.reasons,
         });
       }
 
