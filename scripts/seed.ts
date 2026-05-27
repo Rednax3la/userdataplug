@@ -372,8 +372,9 @@ async function main() {
           .single();
 
         if (curr) {
+          const currRec = curr as Record<string, unknown>;
           for (const f of fields) {
-            if (!curr[f] && contact[f]) update[f] = contact[f];
+            if (!currRec[f] && contact[f]) update[f] = contact[f];
           }
           // Merge source ids
           const sourceIds = [...new Set([...(curr.all_source_ids ?? []), docId])];
