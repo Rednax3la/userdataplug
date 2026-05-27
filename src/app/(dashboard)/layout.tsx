@@ -9,7 +9,7 @@ export default function DashboardLayout({
   return (
     <div className="flex min-h-screen bg-background">
       <Sidebar />
-      <main className="flex-1 pl-60 flex flex-col min-h-screen">
+      <main className="flex-1 md:pl-60 pt-14 md:pt-0 flex flex-col min-h-screen w-0 min-w-0">
         {children}
       </main>
       <Toaster />

@@ -28,26 +28,41 @@ export async function middleware(request: NextRequest) {
     }
   );
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
+  const { data: { user } } = await supabase.auth.getUser();
   const { pathname } = request.nextUrl;
 
-  // Redirect unauthenticated users to /login
-  const publicPaths = ["/", "/login"];
+  const publicPaths = ["/", "/login", "/pending"];
   const isPublic = publicPaths.includes(pathname) || pathname.startsWith("/api/auth");
+
+  // Not logged in → /login
   if (!user && !isPublic) {
     const url = request.nextUrl.clone();
     url.pathname = "/login";
     return NextResponse.redirect(url);
   }
 
-  // Redirect authenticated users away from /login
+  // Logged in user on /login → check approval, then route
   if (user && pathname === "/login") {
     const url = request.nextUrl.clone();
     url.pathname = "/dashboard";
     return NextResponse.redirect(url);
+  }
+
+  // Logged in — check approval for dashboard routes
+  if (user && !isPublic) {
+    const { data: profile } = await supabase
+      .from("user_profiles")
+      .select("approved")
+      .eq("id", user.id)
+      .single();
+
+    // Profile doesn't exist yet (trigger may not have run) — allow through
+    // but if explicitly not approved, send to /pending
+    if (profile && !profile.approved && pathname !== "/pending") {
+      const url = request.nextUrl.clone();
+      url.pathname = "/pending";
+      return NextResponse.redirect(url);
+    }
   }
 
   return supabaseResponse;
