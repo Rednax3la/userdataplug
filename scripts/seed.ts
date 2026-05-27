@@ -37,7 +37,9 @@ if (!ANTHROPIC_API_KEY) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
 
-const pdfParse = require("pdf-parse") as (buf: Buffer) => Promise<{ text: string }>;
+// pdf-parse v1.x exports a function directly
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const pdfParse = require("pdf-parse") as (buf: Buffer, opts?: object) => Promise<{ text: string; numpages: number }>;
 const XLSX = require("xlsx") as typeof import("xlsx");
 const Papa = require("papaparse") as typeof import("papaparse");
 const mammoth = require("mammoth") as { extractRawText: (o: { buffer: Buffer }) => Promise<{ value: string }> };
@@ -169,33 +171,39 @@ function excelToText(buf: Buffer): string {
 
 async function parsePDF(buf: Buffer): Promise<{ rows: Row[]; rawText: string }> {
   try {
-    const { text } = await pdfParse(buf);
-    if (!text || text.trim().length < 20) return { rows: [], rawText: "" };
+    const result = await pdfParse(buf);
+    const text = result.text ?? "";
+    if (!text || text.trim().length < 10) return { rows: [], rawText: "" };
 
     const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
     const splitRows = lines.map((l) => l.split(/\t|\s{3,}/));
 
-    // Try table extraction
+    // Try table extraction first
     if (splitRows.length > 1) {
       const possible = rowsToEntities(splitRows[0], splitRows.slice(1));
       if (possible.length > 0) return { rows: possible, rawText: text };
     }
 
-    // Inline email/phone extraction
+    // Inline email/phone extraction (fast, no AI needed)
     const entities: Row[] = [];
     const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
-    const phoneRe = /(?:\+?(?:254|255|256|260|263|27|234|233|251|250)|\b0)[0-9]{8,9}/g;
+    const phoneRe = /(?:\+?(?:254|255|256|260|263|27|234|233|251|250|44|1)[\s\-]?)[0-9][\d\s\-]{7,13}/g;
     let match;
     const seenEmails = new Set<string>();
     while ((match = emailRe.exec(text)) !== null) {
-      const em = match[0].toLowerCase();
+      const em = match[0].toLowerCase().replace(/[.,;]+$/, "");
       if (!seenEmails.has(em)) { seenEmails.add(em); entities.push({ email: em }); }
     }
     while ((match = phoneRe.exec(text)) !== null) {
-      entities.push({ phone: match[0] });
+      const ph = match[0].replace(/[\s\-]/g, "");
+      entities.push({ phone: ph });
     }
+    // Return both inline matches AND rawText so AI can fill gaps
     return { rows: entities, rawText: text };
-  } catch { return { rows: [], rawText: "" }; }
+  } catch (e) {
+    process.stdout.write(`[pdf-parse error: ${(e as Error).message.slice(0,60)}] `);
+    return { rows: [], rawText: "" };
+  }
 }
 
 async function parseExcel(buf: Buffer): Promise<{ rows: Row[]; rawText: string }> {
@@ -241,64 +249,95 @@ async function parseDOCX(buf: Buffer): Promise<{ rows: Row[]; rawText: string }>
 // ── AI extraction ──────────────────────────────────────────────────────────
 
 let aiCallCount = 0;
+let aiClient: import("@anthropic-ai/sdk").default | null = null;
 
-async function aiExtract(text: string, fileName: string): Promise<Row[]> {
-  if (!ANTHROPIC_API_KEY) return [];
+async function getAI() {
+  if (aiClient) return aiClient;
+  const { default: Anthropic } = await import("@anthropic-ai/sdk");
+  aiClient = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  return aiClient;
+}
+
+async function aiExtractChunk(text: string, fileName: string, chunkNum: number): Promise<Row[]> {
   const trimmed = text.trim();
-  if (trimmed.length < 20) return [];
+  if (trimmed.length < 30) return [];
 
-  // Rate limiting: pause every 10 AI calls to avoid hitting API limits
   aiCallCount++;
-  if (aiCallCount % 10 === 0) {
-    await new Promise((r) => setTimeout(r, 2000));
+  // Rate limiting: 1s pause every 5 calls
+  if (aiCallCount % 5 === 0) {
+    await new Promise((r) => setTimeout(r, 1000));
   }
 
-  try {
-    const { default: Anthropic } = await import("@anthropic-ai/sdk");
-    const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+  const client = await getAI();
+  const chunkLabel = chunkNum > 0 ? ` (chunk ${chunkNum + 1})` : "";
 
+  try {
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 2048,
+      max_tokens: 4096,
       messages: [{
         role: "user",
-        content: `You are extracting contact data from a document named "${fileName}".
+        content: `Extract ALL contacts from this document${chunkLabel}: "${fileName}"
 
-Find EVERY person, professional, delegate, staff member, employee, doctor, contractor, agent, or any named individual mentioned anywhere in the document. Even partial information counts.
+Rules:
+- Include EVERY named person: delegates, staff, doctors, agents, contractors, participants, members, officers
+- Include partial info (name only is fine)
+- Phone: keep raw number including country prefix
+- Return ONLY a JSON array, no markdown, no explanation
 
-For each person found, extract:
-- full_name: their full name (required — if only partial name, include it)
-- email: email address if present
-- phone: phone number if present (include country code if visible)
-- gender: M or F if determinable from name/title
-- country: country of origin or residence
-- company: organisation, employer, or institution they belong to
-- role: job title, designation, or role
+Fields: full_name, email, phone, gender (M/F), country, company, role
 
-Return ONLY a valid JSON array. No explanation, no markdown, just the array.
-Example: [{"full_name":"John Doe","email":"j@example.com","phone":"+254722000000","company":"Acme Ltd","role":"Director"}]
+Example: [{"full_name":"John Doe","email":"j@x.com","phone":"+254722000000","company":"UN","role":"Officer"}]
+If no people: []
 
-If truly no people are mentioned, return: []
-
-DOCUMENT CONTENT:
-${trimmed.slice(0, 7000)}`,
+TEXT:
+${trimmed}`,
       }],
     });
 
     const raw = response.content[0].type === "text" ? response.content[0].text.trim() : "";
-    // Extract JSON array from response
     const arrayMatch = raw.match(/\[[\s\S]*\]/);
     if (!arrayMatch) return [];
     const parsed = JSON.parse(arrayMatch[0]);
     return Array.isArray(parsed) ? parsed as Row[] : [];
   } catch (err) {
-    // Retry once on rate limit
-    if (err instanceof Error && err.message.includes("rate")) {
-      await new Promise((r) => setTimeout(r, 5000));
-      return aiExtract(text, fileName);
+    const msg = err instanceof Error ? err.message : String(err);
+    if (msg.includes("rate") || msg.includes("529")) {
+      await new Promise((r) => setTimeout(r, 8000));
+      return aiExtractChunk(text, fileName, chunkNum); // retry once
     }
+    process.stdout.write(`[AI error: ${msg.slice(0, 60)}] `);
     return [];
   }
+}
+
+// Split text into chunks and run AI on each, deduplicate by email/phone/name
+async function aiExtract(text: string, fileName: string): Promise<Row[]> {
+  if (!ANTHROPIC_API_KEY) return [];
+  const trimmed = text.trim();
+  if (trimmed.length < 30) return [];
+
+  const CHUNK_SIZE = 6000;
+  const chunks: string[] = [];
+  for (let i = 0; i < trimmed.length; i += CHUNK_SIZE) {
+    chunks.push(trimmed.slice(i, i + CHUNK_SIZE));
+  }
+
+  const allRows: Row[] = [];
+  const seenKeys = new Set<string>();
+
+  for (let i = 0; i < chunks.length; i++) {
+    const rows = await aiExtractChunk(chunks[i], fileName, i);
+    for (const row of rows) {
+      const key = (row.email ?? "") + "|" + (row.phone ?? "") + "|" + (row.full_name ?? "");
+      if (key !== "||" && !seenKeys.has(key)) {
+        seenKeys.add(key);
+        allRows.push(row);
+      }
+    }
+  }
+
+  return allRows;
 }
 
 // ── Normalize a row to a DB-ready contact object ───────────────────────────
@@ -446,20 +485,24 @@ async function main() {
       rows = r.rows; rawText = r.rawText;
     }
 
-    // AI fallback for ALL file types that returned 0 contacts
-    // rawText is set when structured extraction failed
-    if (rows.length === 0 && ANTHROPIC_API_KEY) {
-      // For files where we don't have rawText yet, extract it now
-      if (!rawText && (ext === "xls" || ext === "xlsx")) {
-        rawText = excelToText(buf);
-      }
-      if (!rawText && ext === "csv") {
-        rawText = buf.toString("utf-8").slice(0, 8000);
-      }
+    // AI extraction — runs on ALL files with text content
+    // For structured files that already found rows, AI supplements (finds more)
+    // For files with 0 rows, AI is the primary extractor
+    if (ANTHROPIC_API_KEY) {
+      if (!rawText && (ext === "xls" || ext === "xlsx")) rawText = excelToText(buf);
+      if (!rawText && ext === "csv") rawText = buf.toString("utf-8");
 
-      if (rawText.trim().length > 20) {
-        rows = await aiExtract(rawText, fileName);
-        if (rows.length > 0) usedAI = true;
+      if (rawText.trim().length > 30) {
+        const aiRows = await aiExtract(rawText, fileName);
+        if (aiRows.length > 0) {
+          usedAI = true;
+          // Merge AI rows with structured rows (deduplicate by email/name)
+          const existingKeys = new Set(rows.map(r => (r.email ?? "") + "|" + (r.full_name ?? "")));
+          for (const ar of aiRows) {
+            const key = (ar.email ?? "") + "|" + (ar.full_name ?? "");
+            if (!existingKeys.has(key)) { rows.push(ar); existingKeys.add(key); }
+          }
+        }
       }
     }
 

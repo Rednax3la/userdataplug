@@ -31,7 +31,7 @@ export async function middleware(request: NextRequest) {
   const { data: { user } } = await supabase.auth.getUser();
   const { pathname } = request.nextUrl;
 
-  const publicPaths = ["/", "/login", "/pending"];
+  const publicPaths = ["/", "/login"];
   const isPublic = publicPaths.includes(pathname) || pathname.startsWith("/api/auth");
 
   // Not logged in → /login
@@ -41,37 +41,11 @@ export async function middleware(request: NextRequest) {
     return NextResponse.redirect(url);
   }
 
-  // Logged in user on /login → check approval, then route
+  // Logged in on /login → dashboard
   if (user && pathname === "/login") {
     const url = request.nextUrl.clone();
     url.pathname = "/dashboard";
     return NextResponse.redirect(url);
-  }
-
-  // Logged in — check approval for dashboard routes
-  if (user && !isPublic) {
-    const { data: profile, error: profileError } = await supabase
-      .from("user_profiles")
-      .select("approved")
-      .eq("id", user.id)
-      .maybeSingle();
-
-    // If the table doesn't exist yet (migration not run), let through gracefully
-    // Error code 42P01 = relation does not exist
-    const tableIsMissing = profileError && (
-      profileError.code === "42P01" ||
-      profileError.message?.includes("does not exist")
-    );
-
-    if (!tableIsMissing) {
-      // No row (trigger didn't fire yet) OR explicitly not approved → /pending
-      const notApproved = !profile || !profile.approved;
-      if (notApproved && pathname !== "/pending") {
-        const url = request.nextUrl.clone();
-        url.pathname = "/pending";
-        return NextResponse.redirect(url);
-      }
-    }
   }
 
   return supabaseResponse;

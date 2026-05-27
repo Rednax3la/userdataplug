@@ -13,7 +13,7 @@ export default function PendingPage() {
 
   async function signOut() {
     await supabase.auth.signOut();
-    router.push("/login");
+    router.push("/");
   }
 
   async function claimAdmin() {

@@ -33,7 +33,7 @@ function NavContent({ onNav }: { onNav?: () => void }) {
 
   async function handleSignOut() {
     await supabase.auth.signOut();
-    router.push("/login");
+    router.push("/");
     router.refresh();
   }
 
