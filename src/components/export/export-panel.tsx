@@ -49,6 +49,9 @@ export function ExportPanel() {
   const [selected, setSelected] = useState<ExportFormat>("csv");
   const [excludeOptedOut, setExcludeOptedOut] = useState(true);
   const [minConfidence, setMinConfidence] = useState(0);
+  const [hasFilter, setHasFilter] = useState("any");
+  const [country, setCountry] = useState("");
+  const [gender, setGender] = useState("");
   const [loading, setLoading] = useState(false);
 
   const selectedFormat = FORMATS.find((f) => f.id === selected)!;
@@ -60,7 +63,10 @@ export function ExportPanel() {
         format: selected,
         exclude_opted_out: excludeOptedOut.toString(),
         min_confidence: minConfidence.toString(),
+        has: hasFilter,
       });
+      if (country) params.set("country", country);
+      if (gender) params.set("gender", gender);
 
       const res = await fetch(`/api/export?${params.toString()}`);
 
@@ -163,6 +169,58 @@ export function ExportPanel() {
                 />
               </button>
             </label>
+
+            <Separator />
+
+            {/* Has-data filter */}
+            <div>
+              <p className="text-sm font-medium mb-1.5">Contact data</p>
+              <select
+                value={hasFilter}
+                onChange={(e) => setHasFilter(e.target.value)}
+                className="w-full bg-background border border-input text-foreground rounded-md px-2.5 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="any">All contacts</option>
+                <option value="email">Has email</option>
+                <option value="phone">Has phone</option>
+                <option value="both">Has email + phone</option>
+                <option value="email_only">Email only</option>
+                <option value="phone_only">Phone only</option>
+              </select>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <p className="text-xs font-medium mb-1 text-muted-foreground">Country</p>
+                <select
+                  value={country}
+                  onChange={(e) => setCountry(e.target.value)}
+                  className="w-full bg-background border border-input text-foreground rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">All</option>
+                  <option value="KE">Kenya</option>
+                  <option value="UG">Uganda</option>
+                  <option value="TZ">Tanzania</option>
+                  <option value="NG">Nigeria</option>
+                  <option value="GH">Ghana</option>
+                  <option value="ZA">South Africa</option>
+                  <option value="ET">Ethiopia</option>
+                  <option value="RW">Rwanda</option>
+                </select>
+              </div>
+              <div>
+                <p className="text-xs font-medium mb-1 text-muted-foreground">Gender</p>
+                <select
+                  value={gender}
+                  onChange={(e) => setGender(e.target.value)}
+                  className="w-full bg-background border border-input text-foreground rounded-md px-2 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+                >
+                  <option value="">All</option>
+                  <option value="M">Male</option>
+                  <option value="F">Female</option>
+                </select>
+              </div>
+            </div>
 
             <Separator />
 

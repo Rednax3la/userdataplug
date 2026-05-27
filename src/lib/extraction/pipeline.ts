@@ -12,6 +12,7 @@ import {
   normalizeName,
   normalizeGender,
   splitFullName,
+  countryFromPhone,
 } from "./normalizers";
 import type { ExtractedEntity } from "@/types";
 
@@ -361,7 +362,7 @@ export function normalizeEntities(
     const email = normalizeEmail(entity.email);
     const emailAlt = normalizeEmail(entity.email_alt);
     const phone = normalizePhone(entity.phone);
-    const country = normalizeCountry(entity.country);
+    const country = normalizeCountry(entity.country) ?? countryFromPhone(normalizePhone(entity.phone));
     const gender = normalizeGender(entity.gender);
 
     let firstName = normalizeName(entity.first_name);

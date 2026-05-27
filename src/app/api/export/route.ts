@@ -25,6 +25,9 @@ export async function GET(req: NextRequest) {
   const format = sp.get("format") ?? "csv";
   const excludeOptedOut = sp.get("exclude_opted_out") !== "false";
   const minConfidence = sp.get("min_confidence") ? parseFloat(sp.get("min_confidence")!) : 0;
+  const country = sp.get("country");
+  const gender = sp.get("gender");
+  const hasFilter = sp.get("has") ?? "any"; // any | email | phone | both | email_only | phone_only
 
   let query = supabase
     .from("contacts")
@@ -34,6 +37,13 @@ export async function GET(req: NextRequest) {
 
   if (excludeOptedOut) query = query.eq("opted_out", false);
   if (minConfidence > 0) query = query.gte("confidence_score", minConfidence);
+  if (country) query = query.eq("country", country);
+  if (gender) query = query.eq("gender", gender);
+  if (hasFilter === "email") query = query.not("email", "is", null);
+  else if (hasFilter === "phone") query = query.not("phone", "is", null);
+  else if (hasFilter === "both") query = query.not("email", "is", null).not("phone", "is", null);
+  else if (hasFilter === "email_only") query = query.not("email", "is", null).is("phone", null);
+  else if (hasFilter === "phone_only") query = query.is("email", null).not("phone", "is", null);
 
   // Stream all records (max 100k)
   const { data, error } = await query.limit(100000);

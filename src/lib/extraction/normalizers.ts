@@ -174,6 +174,57 @@ export function extractPhonesFromText(text: string): string[] {
 }
 
 /**
+ * Infer ISO alpha-2 country code from E.164 phone prefix.
+ * Covers all country calling codes.
+ */
+const PHONE_PREFIX_MAP: [string, string][] = [
+  // Longer prefixes first (most specific)
+  ["1242", "BS"], ["1246", "BB"], ["1264", "AI"], ["1268", "AG"],
+  ["1284", "VG"], ["1340", "VI"], ["1345", "KY"], ["1441", "BM"],
+  ["1473", "GD"], ["1649", "TC"], ["1664", "MS"], ["1670", "MP"],
+  ["1671", "GU"], ["1684", "AS"], ["1721", "SX"], ["1758", "LC"],
+  ["1767", "DM"], ["1784", "VC"], ["1787", "PR"], ["1809", "DO"],
+  ["1868", "TT"], ["1869", "KN"], ["1876", "JM"],
+  ["254", "KE"], ["255", "TZ"], ["256", "UG"], ["257", "BI"],
+  ["258", "MZ"], ["260", "ZM"], ["261", "MG"], ["262", "RE"],
+  ["263", "ZW"], ["264", "NA"], ["265", "MW"], ["266", "LS"],
+  ["267", "BW"], ["268", "SZ"], ["269", "KM"], ["27", "ZA"],
+  ["290", "SH"], ["291", "ER"], ["297", "AW"], ["298", "FO"],
+  ["299", "GL"],
+  ["212", "MA"], ["213", "DZ"], ["216", "TN"], ["218", "LY"],
+  ["220", "GM"], ["221", "SN"], ["222", "MR"], ["223", "ML"],
+  ["224", "GN"], ["225", "CI"], ["226", "BF"], ["227", "NE"],
+  ["228", "TG"], ["229", "BJ"], ["230", "MU"], ["231", "LR"],
+  ["232", "SL"], ["233", "GH"], ["234", "NG"], ["235", "TD"],
+  ["236", "CF"], ["237", "CM"], ["238", "CV"], ["239", "ST"],
+  ["240", "GQ"], ["241", "GA"], ["242", "CG"], ["243", "CD"],
+  ["244", "AO"], ["245", "GW"], ["246", "IO"], ["247", "AC"],
+  ["248", "SC"], ["249", "SD"], ["250", "RW"], ["251", "ET"],
+  ["252", "SO"], ["253", "DJ"],
+  ["20", "EG"], ["30", "GR"], ["31", "NL"], ["32", "BE"],
+  ["33", "FR"], ["34", "ES"], ["36", "HU"], ["39", "IT"],
+  ["40", "RO"], ["41", "CH"], ["43", "AT"], ["44", "GB"],
+  ["45", "DK"], ["46", "SE"], ["47", "NO"], ["48", "PL"],
+  ["49", "DE"], ["51", "PE"], ["52", "MX"], ["53", "CU"],
+  ["54", "AR"], ["55", "BR"], ["56", "CL"], ["57", "CO"],
+  ["58", "VE"], ["60", "MY"], ["61", "AU"], ["62", "ID"],
+  ["63", "PH"], ["64", "NZ"], ["65", "SG"], ["66", "TH"],
+  ["7", "RU"], ["81", "JP"], ["82", "KR"], ["84", "VN"],
+  ["86", "CN"], ["90", "TR"], ["91", "IN"], ["92", "PK"],
+  ["93", "AF"], ["94", "LK"], ["95", "MM"], ["98", "IR"],
+  ["1", "US"],
+];
+
+export function countryFromPhone(e164: string | null | undefined): string | null {
+  if (!e164) return null;
+  const digits = e164.startsWith("+") ? e164.slice(1) : e164;
+  for (const [prefix, code] of PHONE_PREFIX_MAP) {
+    if (digits.startsWith(prefix)) return code;
+  }
+  return null;
+}
+
+/**
  * Simple Levenshtein distance for fuzzy name matching.
  */
 export function levenshtein(a: string, b: string): number {
