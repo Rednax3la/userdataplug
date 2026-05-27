@@ -415,7 +415,11 @@ async function alreadyExists(email: string | null, phone: string | null): Promis
 // ── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
+  // --force: reprocess all files even if already marked done
+  const force = process.argv.includes("--force");
+
   console.log("🔍  Scanning:", DATA_DIR);
+  if (force) console.log("⚡  Force mode: reprocessing all files");
 
   if (!fs.existsSync(DATA_DIR)) {
     console.error("❌  Data directory not found:", DATA_DIR);
@@ -451,8 +455,8 @@ async function main() {
       .eq("file_name", fileName)
       .maybeSingle();
 
-    // Skip files that are already fully processed
-    if (existing?.status === "done") {
+    // Skip files already fully processed (unless --force)
+    if (!force && existing?.status === "done") {
       process.stdout.write("SKIP\n");
       continue;
     }
