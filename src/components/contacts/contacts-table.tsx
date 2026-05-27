@@ -275,7 +275,7 @@ export function ContactsTable() {
                       <div className="flex items-center gap-1.5">
                         {c.is_flagged && <AlertTriangle className="h-3.5 w-3.5 text-amber-500 shrink-0" />}
                         <span className="font-medium text-sm">
-                          {c.full_name ?? [c.first_name, c.last_name].filter(Boolean).join(" ") || (
+                          {(c.full_name ?? [c.first_name, c.last_name].filter(Boolean).join(" ")) || (
                             <span className="text-muted-foreground italic">Unknown</span>
                           )}
                         </span>
