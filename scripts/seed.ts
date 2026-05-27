@@ -11,14 +11,13 @@
 // Requires .env.local with:
 //   NEXT_PUBLIC_SUPABASE_URL
 //   SUPABASE_SERVICE_ROLE_KEY
-//   ANTHROPIC_API_KEY  (optional — used for AI fallback on unstructured text)
+//   ANTHROPIC_API_KEY  (required for AI extraction of unstructured files)
 // ============================================================
 
 import * as fs from "fs";
 import * as path from "path";
 import * as dotenv from "dotenv";
 
-// Load .env.local
 dotenv.config({ path: path.join(__dirname, "../.env.local") });
 
 import { createClient } from "@supabase/supabase-js";
@@ -32,42 +31,60 @@ if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error("❌  Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env.local");
   process.exit(1);
 }
+if (!ANTHROPIC_API_KEY) {
+  console.warn("⚠️   ANTHROPIC_API_KEY not set — AI extraction disabled. Most files will yield 0 contacts.");
+}
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
-// ── Lazy-load pipeline (avoids Next.js module issues) ──────────────────────
-// We duplicate the key extraction logic here using the same deps so the script
-// runs standalone without Next.js.
 
 const pdfParse = require("pdf-parse") as (buf: Buffer) => Promise<{ text: string }>;
 const XLSX = require("xlsx") as typeof import("xlsx");
 const Papa = require("papaparse") as typeof import("papaparse");
 const mammoth = require("mammoth") as { extractRawText: (o: { buffer: Buffer }) => Promise<{ value: string }> };
 
-// ── Normalizers (inline — mirrors src/lib/extraction/normalizers.ts) ───────
+// ── Normalizers ────────────────────────────────────────────────────────────
 
 function normalizeEmail(raw?: string | null): string | null {
   if (!raw) return null;
   const e = raw.trim().toLowerCase().replace(/\s+/g, "");
-  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
+  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(e) ? e : null;
 }
 
 function normalizePhone(raw?: string | null): string | null {
   if (!raw) return null;
-  const digits = raw.replace(/[^\d+]/g, "");
-  if (digits.length < 7) return null;
-  if (digits.startsWith("+")) return digits;
-  if (digits.startsWith("0") && digits.length >= 10) return "+254" + digits.slice(1);
-  if (digits.length === 12 && digits.startsWith("254")) return "+" + digits;
-  if (digits.length === 10) return "+254" + digits.slice(1);
-  return digits.length >= 10 ? "+" + digits : null;
+  // Strip everything except digits and leading +
+  const cleaned = raw.trim().replace(/[^\d+]/g, "");
+  if (cleaned.length < 7) return null;
+
+  // E.164 max is 15 digits — reject anything longer (concatenated numbers / garbage)
+  const justDigits = cleaned.replace(/^\+/, "");
+  if (justDigits.length > 15) return null;
+
+  // Already has country code with +
+  if (cleaned.startsWith("+")) return cleaned;
+
+  // 254XXXXXXXXX (Kenya without +)
+  if (justDigits.startsWith("254") && justDigits.length === 12) return "+" + justDigits;
+
+  // 07XXXXXXXX or 01XXXXXXXX (Kenya local)
+  if (justDigits.startsWith("0") && justDigits.length === 10) return "+254" + justDigits.slice(1);
+
+  // 10-digit number with no prefix — assume Kenya
+  if (justDigits.length === 10) return "+254" + justDigits.slice(1);
+
+  // International without + (e.g. 447911123456)
+  if (justDigits.length >= 11 && justDigits.length <= 15) return "+" + justDigits;
+
+  return null;
 }
 
 const COUNTRY_MAP: Record<string, string> = {
   kenya: "KE", uganda: "UG", tanzania: "TZ", nigeria: "NG",
   ghana: "GH", "south africa": "ZA", ethiopia: "ET", rwanda: "RW",
   zambia: "ZM", zimbabwe: "ZW", malawi: "MW", botswana: "BW",
+  mozambique: "MZ", senegal: "SN", "ivory coast": "CI", cameroon: "CM",
   uk: "GB", "united kingdom": "GB", usa: "US", "united states": "US",
+  india: "IN", china: "CN", france: "FR", germany: "DE",
 };
 
 function normalizeCountry(raw?: string | null): string | null {
@@ -81,18 +98,27 @@ function normalizeCountry(raw?: string | null): string | null {
 // ── Header map ─────────────────────────────────────────────────────────────
 
 const HEADER_MAP: Record<string, string> = {
-  email: "email", "e-mail": "email", "email address": "email",
+  email: "email", "e-mail": "email", "email address": "email", "email_address": "email",
   phone: "phone", telephone: "phone", mobile: "phone", cell: "phone",
   "phone number": "phone", "mobile number": "phone", "contact no": "phone",
+  "contact number": "phone", tel: "phone", "tel.": "phone", "mobile no": "phone",
   "first name": "first_name", firstname: "first_name", fn: "first_name",
-  "last name": "last_name", lastname: "last_name", surname: "last_name", ln: "last_name",
+  "given name": "first_name", forename: "first_name", "given names": "first_name",
+  "last name": "last_name", lastname: "last_name", surname: "last_name",
+  "family name": "last_name", ln: "last_name",
   name: "full_name", "full name": "full_name", fullname: "full_name",
-  participant: "full_name", member: "full_name", contact: "full_name", delegate: "full_name",
+  "full_name": "full_name", participant: "full_name", member: "full_name",
+  contact: "full_name", delegate: "full_name", attendee: "full_name",
+  "contact name": "full_name", "attendee name": "full_name", officer: "full_name",
+  staff: "full_name", employee: "full_name", "staff name": "full_name",
   gender: "gender", sex: "gender",
   country: "country", nationality: "country", nation: "country",
-  city: "city", town: "city", location: "city",
-  company: "company", organisation: "company", organization: "company", employer: "company",
+  city: "city", town: "city", location: "city", "city/town": "city",
+  company: "company", organisation: "company", organization: "company",
+  employer: "company", institution: "company", "org name": "company",
+  "organisation name": "company", "organization name": "company",
   role: "role", title: "role", position: "role", designation: "role",
+  occupation: "role", "job title": "role", "job_title": "role",
 };
 
 interface Row { [key: string]: string }
@@ -116,39 +142,63 @@ function rowsToEntities(headers: string[], rows: string[][]): Row[] {
       if (val) obj[field] = val;
     });
     return obj;
-  }).filter((r) => r.email || r.phone || r.full_name);
+  }).filter((r) => r.email || r.phone || r.full_name || r.first_name);
+}
+
+// ── Text extractors (for AI fallback) ─────────────────────────────────────
+
+function excelToText(buf: Buffer): string {
+  try {
+    const wb = XLSX.read(buf, { type: "buffer" });
+    const lines: string[] = [];
+    for (const sn of wb.SheetNames.slice(0, 5)) {
+      const aoa: string[][] = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: "" });
+      if (aoa.length === 0) continue;
+      lines.push(`[Sheet: ${sn}]`);
+      // Include headers and first 200 rows
+      for (const row of aoa.slice(0, 200)) {
+        const cells = row.map(String).map(c => c.trim()).filter(Boolean);
+        if (cells.length > 0) lines.push(cells.join(" | "));
+      }
+    }
+    return lines.join("\n");
+  } catch { return ""; }
 }
 
 // ── Parsers ────────────────────────────────────────────────────────────────
 
-async function parsePDF(buf: Buffer): Promise<Row[]> {
+async function parsePDF(buf: Buffer): Promise<{ rows: Row[]; rawText: string }> {
   try {
     const { text } = await pdfParse(buf);
-    if (!text || text.trim().length < 20) return [];
+    if (!text || text.trim().length < 20) return { rows: [], rawText: "" };
+
     const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
-    const rows = lines.map((l) => l.split(/\t|\s{2,}/));
-    if (rows.length > 1) {
-      const possible = rowsToEntities(rows[0], rows.slice(1));
-      if (possible.length > 0) return possible;
+    const splitRows = lines.map((l) => l.split(/\t|\s{3,}/));
+
+    // Try table extraction
+    if (splitRows.length > 1) {
+      const possible = rowsToEntities(splitRows[0], splitRows.slice(1));
+      if (possible.length > 0) return { rows: possible, rawText: text };
     }
-    // Inline extraction
+
+    // Inline email/phone extraction
     const entities: Row[] = [];
     const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
-    const phoneRe = /(?:\+?254|0)[0-9]{9}/g;
+    const phoneRe = /(?:\+?(?:254|255|256|260|263|27|234|233|251|250)|\b0)[0-9]{8,9}/g;
     let match;
-    const seen = new Set<string>();
+    const seenEmails = new Set<string>();
     while ((match = emailRe.exec(text)) !== null) {
       const em = match[0].toLowerCase();
-      if (!seen.has(em)) { seen.add(em); entities.push({ email: em }); }
+      if (!seenEmails.has(em)) { seenEmails.add(em); entities.push({ email: em }); }
     }
     while ((match = phoneRe.exec(text)) !== null) {
       entities.push({ phone: match[0] });
     }
-    return entities;
-  } catch { return []; }
+    return { rows: entities, rawText: text };
+  } catch { return { rows: [], rawText: "" }; }
 }
 
-async function parseExcel(buf: Buffer): Promise<Row[]> {
+async function parseExcel(buf: Buffer): Promise<{ rows: Row[]; rawText: string }> {
   try {
     const wb = XLSX.read(buf, { type: "buffer" });
     const all: Row[] = [];
@@ -158,57 +208,97 @@ async function parseExcel(buf: Buffer): Promise<Row[]> {
       const headers = aoa[0].map(String);
       all.push(...rowsToEntities(headers, aoa.slice(1).map((r) => r.map(String))));
     }
-    return all;
-  } catch { return []; }
+    const rawText = all.length === 0 ? excelToText(buf) : "";
+    return { rows: all, rawText };
+  } catch { return { rows: [], rawText: excelToText(buf) }; }
 }
 
-async function parseCSV(buf: Buffer): Promise<Row[]> {
+async function parseCSV(buf: Buffer): Promise<{ rows: Row[]; rawText: string }> {
   try {
     const text = buf.toString("utf-8");
     const result = Papa.parse<string[]>(text, { header: false, skipEmptyLines: true });
     const rows = result.data as string[][];
-    if (rows.length < 2) return [];
-    return rowsToEntities(rows[0].map(String), rows.slice(1).map((r) => r.map(String)));
-  } catch { return []; }
+    if (rows.length < 2) return { rows: [], rawText: text.slice(0, 8000) };
+    const entities = rowsToEntities(rows[0].map(String), rows.slice(1).map((r) => r.map(String)));
+    return { rows: entities, rawText: entities.length === 0 ? text.slice(0, 8000) : "" };
+  } catch { return { rows: [], rawText: "" }; }
 }
 
-async function parseDOCX(buf: Buffer): Promise<Row[]> {
+async function parseDOCX(buf: Buffer): Promise<{ rows: Row[]; rawText: string }> {
   try {
     const { value } = await mammoth.extractRawText({ buffer: buf });
-    if (!value || value.trim().length < 20) return [];
+    if (!value || value.trim().length < 20) return { rows: [], rawText: "" };
     const entities: Row[] = [];
     const emailRe = /[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g;
     let match;
     while ((match = emailRe.exec(value)) !== null) {
       entities.push({ email: match[0].toLowerCase() });
     }
-    return entities;
-  } catch { return []; }
+    return { rows: entities, rawText: entities.length === 0 ? value : "" };
+  } catch { return { rows: [], rawText: "" }; }
 }
 
-// ── AI fallback for unstructured content ───────────────────────────────────
+// ── AI extraction ──────────────────────────────────────────────────────────
 
-async function aiExtract(text: string): Promise<Row[]> {
-  if (!ANTHROPIC_API_KEY || text.trim().length < 50) return [];
+let aiCallCount = 0;
+
+async function aiExtract(text: string, fileName: string): Promise<Row[]> {
+  if (!ANTHROPIC_API_KEY) return [];
+  const trimmed = text.trim();
+  if (trimmed.length < 20) return [];
+
+  // Rate limiting: pause every 10 AI calls to avoid hitting API limits
+  aiCallCount++;
+  if (aiCallCount % 10 === 0) {
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+
   try {
     const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const client = new Anthropic({ apiKey: ANTHROPIC_API_KEY });
+
     const response = await client.messages.create({
       model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
+      max_tokens: 2048,
       messages: [{
         role: "user",
-        content: `Extract all person contact records from the text below. Return ONLY a JSON array of objects with fields: full_name, email, phone, gender, country, company, role. Omit fields that are absent. If no contacts, return [].
+        content: `You are extracting contact data from a document named "${fileName}".
 
-TEXT:
-${text.slice(0, 4000)}`,
+Find EVERY person, professional, delegate, staff member, employee, doctor, contractor, agent, or any named individual mentioned anywhere in the document. Even partial information counts.
+
+For each person found, extract:
+- full_name: their full name (required — if only partial name, include it)
+- email: email address if present
+- phone: phone number if present (include country code if visible)
+- gender: M or F if determinable from name/title
+- country: country of origin or residence
+- company: organisation, employer, or institution they belong to
+- role: job title, designation, or role
+
+Return ONLY a valid JSON array. No explanation, no markdown, just the array.
+Example: [{"full_name":"John Doe","email":"j@example.com","phone":"+254722000000","company":"Acme Ltd","role":"Director"}]
+
+If truly no people are mentioned, return: []
+
+DOCUMENT CONTENT:
+${trimmed.slice(0, 7000)}`,
       }],
     });
-    const raw = response.content[0].type === "text" ? response.content[0].text : "";
-    const match = raw.match(/\[[\s\S]*\]/);
-    if (!match) return [];
-    return JSON.parse(match[0]) as Row[];
-  } catch { return []; }
+
+    const raw = response.content[0].type === "text" ? response.content[0].text.trim() : "";
+    // Extract JSON array from response
+    const arrayMatch = raw.match(/\[[\s\S]*\]/);
+    if (!arrayMatch) return [];
+    const parsed = JSON.parse(arrayMatch[0]);
+    return Array.isArray(parsed) ? parsed as Row[] : [];
+  } catch (err) {
+    // Retry once on rate limit
+    if (err instanceof Error && err.message.includes("rate")) {
+      await new Promise((r) => setTimeout(r, 5000));
+      return aiExtract(text, fileName);
+    }
+    return [];
+  }
 }
 
 // ── Normalize a row to a DB-ready contact object ───────────────────────────
@@ -225,6 +315,14 @@ function normalize(row: Row, sourceId: string): Record<string, unknown> | null {
   const composedName = fullName ??
     (firstName && lastName ? `${firstName} ${lastName}` : firstName ?? lastName ?? null);
 
+  // Reject name-only rows with very short or clearly non-human names
+  if (!email && !phone && composedName && composedName.length < 3) return null;
+
+  const rawGender = (row.gender ?? "").toUpperCase();
+  let gender: string | null = null;
+  if (rawGender.startsWith("F") || rawGender === "FEMALE") gender = "F";
+  else if (rawGender.startsWith("M") || rawGender === "MALE") gender = "M";
+
   return {
     email,
     phone,
@@ -232,13 +330,12 @@ function normalize(row: Row, sourceId: string): Record<string, unknown> | null {
     first_name: firstName,
     last_name: lastName,
     full_name: composedName,
-    gender: row.gender?.toUpperCase().startsWith("F") ? "F" :
-            row.gender?.toUpperCase().startsWith("M") ? "M" : null,
+    gender,
     country: normalizeCountry(row.country),
     country_raw: row.country ?? null,
-    city: row.city ?? null,
-    company: row.company ?? null,
-    role: row.role ?? null,
+    city: (row.city ?? "").trim() || null,
+    company: (row.company ?? "").trim() || null,
+    role: (row.role ?? "").trim() || null,
     confidence_score: email ? 0.8 : phone ? 0.7 : 0.5,
     primary_source_id: sourceId,
     all_source_ids: [sourceId],
@@ -257,8 +354,7 @@ async function alreadyExists(email: string | null, phone: string | null): Promis
       .from("contacts")
       .select("id")
       .eq("email", email)
-      .limit(1)
-      .single();
+      .maybeSingle();
     if (data) return data.id as string;
   }
   if (phone) {
@@ -266,8 +362,7 @@ async function alreadyExists(email: string | null, phone: string | null): Promis
       .from("contacts")
       .select("id")
       .eq("phone", phone)
-      .limit(1)
-      .single();
+      .maybeSingle();
     if (data) return data.id as string;
   }
   return null;
@@ -288,11 +383,12 @@ async function main() {
     return [".pdf", ".xls", ".xlsx", ".csv", ".docx"].includes(ext);
   });
 
-  console.log(`📁  Found ${allFiles.length} files to process\n`);
+  console.log(`📁  Found ${allFiles.length} files to process`);
+  console.log(`🤖  AI extraction: ${ANTHROPIC_API_KEY ? "ENABLED (all files without structured data)" : "DISABLED"}\n`);
 
   let totalInserted = 0;
   let totalMerged = 0;
-  let totalSkipped = 0;
+  let aiUsed = 0;
   let filesDone = 0;
 
   for (const fileName of allFiles) {
@@ -301,51 +397,81 @@ async function main() {
     const buf = fs.readFileSync(filePath);
     filesDone++;
 
-    process.stdout.write(`[${filesDone}/${allFiles.length}] ${fileName.slice(0, 60)}... `);
+    const display = fileName.length > 55 ? fileName.slice(0, 55) + "…" : fileName;
+    process.stdout.write(`[${filesDone}/${allFiles.length}] ${display}... `);
 
-    // Create a source document record
-    const { data: docRec } = await supabase
+    // Create source document record (upsert by file_name to allow re-runs)
+    const { data: existing } = await supabase
       .from("source_documents")
-      .insert({
-        upload_id: null,
-        file_name: fileName,
-        file_path: `local/${fileName}`,
-        file_type: ext,
-        file_size: buf.length,
-        status: "parsing",
-      })
       .select("id")
-      .single();
+      .eq("file_name", fileName)
+      .maybeSingle();
 
-    if (!docRec) {
-      process.stdout.write("⚠️  doc insert failed\n");
-      continue;
+    let docId: string;
+    if (existing) {
+      docId = existing.id as string;
+    } else {
+      const { data: docRec } = await supabase
+        .from("source_documents")
+        .insert({
+          upload_id: null,
+          file_name: fileName,
+          file_path: `local/${fileName}`,
+          file_type: ext,
+          file_size: buf.length,
+          status: "parsing",
+        })
+        .select("id")
+        .single();
+      if (!docRec) { process.stdout.write("⚠️  doc insert failed\n"); continue; }
+      docId = docRec.id as string;
     }
 
-    const docId = docRec.id as string;
-
-    // Parse
+    // Parse with structured extractor first
     let rows: Row[] = [];
-    if (ext === "pdf") rows = await parsePDF(buf);
-    else if (ext === "xls" || ext === "xlsx") rows = await parseExcel(buf);
-    else if (ext === "csv") rows = await parseCSV(buf);
-    else if (ext === "docx") rows = await parseDOCX(buf);
+    let rawText = "";
+    let usedAI = false;
 
-    // AI fallback if nothing found and file is not huge
-    if (rows.length === 0 && buf.length < 2_000_000) {
-      let text = "";
-      try {
-        if (ext === "pdf") { const r = await pdfParse(buf); text = r.text; }
-        else if (ext === "docx") { const r = await mammoth.extractRawText({ buffer: buf }); text = r.value; }
-      } catch { /* ignore */ }
-      if (text.trim().length > 50) rows = await aiExtract(text);
+    if (ext === "pdf") {
+      const r = await parsePDF(buf);
+      rows = r.rows; rawText = r.rawText;
+    } else if (ext === "xls" || ext === "xlsx") {
+      const r = await parseExcel(buf);
+      rows = r.rows; rawText = r.rawText;
+    } else if (ext === "csv") {
+      const r = await parseCSV(buf);
+      rows = r.rows; rawText = r.rawText;
+    } else if (ext === "docx") {
+      const r = await parseDOCX(buf);
+      rows = r.rows; rawText = r.rawText;
+    }
+
+    // AI fallback for ALL file types that returned 0 contacts
+    // rawText is set when structured extraction failed
+    if (rows.length === 0 && ANTHROPIC_API_KEY) {
+      // For files where we don't have rawText yet, extract it now
+      if (!rawText && (ext === "xls" || ext === "xlsx")) {
+        rawText = excelToText(buf);
+      }
+      if (!rawText && ext === "csv") {
+        rawText = buf.toString("utf-8").slice(0, 8000);
+      }
+
+      if (rawText.trim().length > 20) {
+        rows = await aiExtract(rawText, fileName);
+        if (rows.length > 0) usedAI = true;
+      }
     }
 
     if (rows.length === 0) {
-      await supabase.from("source_documents").update({ status: "done", entities_found: 0 }).eq("id", docId);
+      await supabase.from("source_documents")
+        .update({ status: "done", entities_found: 0 })
+        .eq("id", docId);
       process.stdout.write("0 contacts\n");
       continue;
     }
+
+    if (usedAI) aiUsed++;
 
     // Normalize + upsert
     let inserted = 0;
@@ -361,23 +487,21 @@ async function main() {
       );
 
       if (existingId) {
-        // Merge — update any null fields in existing record with new data
         const update: Record<string, unknown> = {};
         const fields = ["full_name", "first_name", "last_name", "gender", "country", "city", "company", "role"] as const;
-        // Get current record
+
         const { data: curr } = await supabase
           .from("contacts")
           .select(fields.join(",") + ",all_source_ids")
           .eq("id", existingId)
-          .single();
+          .maybeSingle();
 
         if (curr) {
           const currRec = curr as Record<string, unknown>;
           for (const f of fields) {
             if (!currRec[f] && contact[f]) update[f] = contact[f];
           }
-          // Merge source ids
-          const sourceIds = [...new Set([...(curr.all_source_ids ?? []), docId])];
+          const sourceIds = [...new Set([...((curr.all_source_ids as string[]) ?? []), docId])];
           update.all_source_ids = sourceIds;
           if (Object.keys(update).length > 1) {
             await supabase.from("contacts").update(update).eq("id", existingId);
@@ -392,7 +516,6 @@ async function main() {
 
     totalInserted += inserted;
     totalMerged += merged;
-    totalSkipped += rows.length - inserted - merged;
 
     await supabase.from("source_documents").update({
       status: "done",
@@ -400,14 +523,15 @@ async function main() {
       completed_at: new Date().toISOString(),
     }).eq("id", docId);
 
-    process.stdout.write(`${inserted} inserted, ${merged} merged\n`);
+    const aiTag = usedAI ? " (AI)" : "";
+    process.stdout.write(`${inserted} inserted, ${merged} merged${aiTag}\n`);
   }
 
   console.log("\n" + "=".repeat(60));
   console.log(`✅  Done. ${filesDone} files processed.`);
   console.log(`   Inserted : ${totalInserted}`);
   console.log(`   Merged   : ${totalMerged}`);
-  console.log(`   Skipped  : ${totalSkipped} (no usable data)`);
+  console.log(`   AI used  : ${aiUsed} files`);
   console.log("=".repeat(60));
 }
 
