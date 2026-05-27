@@ -145,7 +145,8 @@ function rowsToEntities(headers: string[], rows: string[][]): Row[] {
       if (val) obj[field] = val;
     });
     return obj;
-  }).filter((r) => r.email || r.phone || r.full_name || r.first_name);
+  // Must have at least email or phone — name-only rows waste tokens and pollute the DB
+  }).filter((r) => r.email || r.phone);
 }
 
 // ── Text extractors (for AI fallback) ─────────────────────────────────────
@@ -212,10 +213,16 @@ async function parseExcel(buf: Buffer): Promise<{ rows: Row[]; rawText: string }
     const wb = XLSX.read(buf, { type: "buffer" });
     const all: Row[] = [];
     for (const sn of wb.SheetNames) {
-      const aoa: string[][] = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: "" });
+      // raw: true avoids scientific notation on large phone numbers (e.g. 254712345678 → 2.54E+11)
+      const aoa: unknown[][] = XLSX.utils.sheet_to_json(wb.Sheets[sn], { header: 1, defval: "", raw: true });
       if (aoa.length < 2) continue;
-      const headers = aoa[0].map(String);
-      all.push(...rowsToEntities(headers, aoa.slice(1).map((r) => r.map(String))));
+      // Convert each cell to full-precision string
+      const stringify = (v: unknown) =>
+        v === null || v === undefined ? "" :
+        typeof v === "number" && Number.isInteger(v) ? String(v) : String(v);
+      const headers = aoa[0].map(stringify);
+      const dataRows = aoa.slice(1).map((r) => (r as unknown[]).map(stringify));
+      all.push(...rowsToEntities(headers, dataRows));
     }
     const rawText = all.length === 0 ? excelToText(buf) : "";
     return { rows: all, rawText };
@@ -278,18 +285,18 @@ async function aiExtractChunk(text: string, fileName: string, chunkNum: number):
       max_tokens: 4096,
       messages: [{
         role: "user",
-        content: `Extract ALL contacts from this document${chunkLabel}: "${fileName}"
+        content: `Extract contacts from this document${chunkLabel}: "${fileName}"
 
 Rules:
-- Include EVERY named person: delegates, staff, doctors, agents, contractors, participants, members, officers
-- Include partial info (name only is fine)
-- Phone: keep raw number including country prefix
+- ONLY include people who have at least an email address OR a phone number
+- Do NOT include name-only entries with no email and no phone
+- Phone: keep raw number including country prefix (e.g. 254712345678 or +254712345678)
 - Return ONLY a JSON array, no markdown, no explanation
 
 Fields: full_name, email, phone, gender (M/F), country, company, role
 
 Example: [{"full_name":"John Doe","email":"j@x.com","phone":"+254722000000","company":"UN","role":"Officer"}]
-If no people: []
+If no qualifying contacts: []
 
 TEXT:
 ${trimmed}`,
@@ -350,13 +357,11 @@ function normalize(row: Row, sourceId: string): Record<string, unknown> | null {
   const firstName = (row.first_name ?? "").trim() || null;
   const lastName = (row.last_name ?? "").trim() || null;
 
-  if (!email && !phone && !fullName && !firstName) return null;
+  // Require at least email or phone — name-only rows aren't useful contacts
+  if (!email && !phone) return null;
 
   const composedName = fullName ??
     (firstName && lastName ? `${firstName} ${lastName}` : firstName ?? lastName ?? null);
-
-  // Reject name-only rows with very short or clearly non-human names
-  if (!email && !phone && composedName && composedName.length < 3) return null;
 
   const rawGender = (row.gender ?? "").toUpperCase();
   let gender: string | null = null;
@@ -420,7 +425,16 @@ async function seedAdanta(): Promise<{ inserted: number; merged: number }> {
   const buf = fs.readFileSync(ADANTA_PATH);
   const wb = XLSX.read(buf, { type: "buffer" });
   const ws = wb.Sheets[wb.SheetNames[0]];
-  const rows: Record<string, string>[] = XLSX.utils.sheet_to_json(ws, { defval: "" });
+  // raw: true prevents scientific notation on large phone numbers; convert manually
+  const rawRows: Record<string, unknown>[] = XLSX.utils.sheet_to_json(ws, { defval: "", raw: true });
+  const rows: Record<string, string>[] = rawRows.map((r) => {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(r)) {
+      out[k] = v === null || v === undefined ? "" :
+        typeof v === "number" && Number.isInteger(v) ? String(v) : String(v);
+    }
+    return out;
+  });
 
   // Upsert source doc
   const { data: existingDoc } = await supabase
@@ -564,9 +578,15 @@ async function main() {
     // Create source document record (upsert by file_name to allow re-runs)
     const { data: existing } = await supabase
       .from("source_documents")
-      .select("id")
+      .select("id, status")
       .eq("file_name", fileName)
       .maybeSingle();
+
+    // Skip files that are already fully processed
+    if (existing?.status === "done") {
+      process.stdout.write("SKIP\n");
+      continue;
+    }
 
     let docId: string;
     if (existing) {

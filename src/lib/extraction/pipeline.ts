@@ -227,11 +227,24 @@ export async function parseExcel(buffer: ArrayBuffer): Promise<ExtractedEntity[]
 
     for (const sheetName of wb.SheetNames) {
       const ws = wb.Sheets[sheetName];
-      const rows: string[][] = XLSX.utils.sheet_to_json(ws, {
+      // raw: true to avoid scientific notation on large phone numbers (e.g. 254712345678 → 2.54E+11)
+      const rawRows = XLSX.utils.sheet_to_json(ws, {
         header: 1,
         defval: "",
-        raw: false,
-      }) as string[][];
+        raw: true,
+      }) as unknown[][];
+
+      // Convert each cell to string safely — numbers get full-precision representation
+      const rows: string[][] = rawRows.map((row) =>
+        row.map((cell) => {
+          if (cell === null || cell === undefined) return "";
+          if (typeof cell === "number") {
+            // Use toFixed(0) only for integers to avoid losing precision
+            return Number.isInteger(cell) ? String(cell) : String(cell);
+          }
+          return String(cell);
+        })
+      );
 
       entities.push(...extractFromTable(rows));
     }
