@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
-import { runExtractionPipeline } from "@/lib/extraction/pipeline";
-import { findDuplicates, mergeContacts } from "@/lib/extraction/deduplicator";
+import { runExtractionPipeline, normalizeEntities } from "@/lib/extraction/pipeline";
+import { mergeContacts } from "@/lib/extraction/deduplicator";
 import type { Contact } from "@/types";
 
-// Allow up to 60s — works on Pro; free tier will cut at ~10s but UI is already unblocked
 export const maxDuration = 60;
 
 export async function POST(
@@ -19,7 +18,6 @@ export async function POST(
 
   const service = await createServiceClient();
 
-  // Fetch upload + source document
   const { data: upload } = await service
     .from("uploads")
     .select("*")
@@ -29,9 +27,8 @@ export async function POST(
 
   if (!upload) return NextResponse.json({ error: "Upload not found" }, { status: 404 });
 
-  // Already processed or currently in-flight — skip
-  if (upload.status === "done" || upload.status === "processing") {
-    return NextResponse.json({ status: upload.status });
+  if (upload.status === "done") {
+    return NextResponse.json({ status: "done" });
   }
 
   const { data: doc } = await service
@@ -42,14 +39,13 @@ export async function POST(
 
   if (!doc) return NextResponse.json({ error: "Document not found" }, { status: 404 });
 
-  // Mark as processing
   await Promise.all([
     service.from("uploads").update({ status: "processing" }).eq("id", uploadId),
     service.from("source_documents").update({ status: "parsing" }).eq("id", doc.id),
   ]);
 
   try {
-    // Download file from Supabase Storage
+    // Download file
     const { data: fileData, error: dlError } = await service.storage
       .from("uploads")
       .download(upload.storage_path);
@@ -60,7 +56,6 @@ export async function POST(
 
     await service.from("source_documents").update({ status: "extracting" }).eq("id", doc.id);
 
-    // Run extraction pipeline
     const normalizedContacts = await runExtractionPipeline(
       buffer,
       upload.file_type,
@@ -68,87 +63,94 @@ export async function POST(
       process.env.ANTHROPIC_API_KEY
     );
 
+    if (normalizedContacts.length === 0) {
+      await service.from("source_documents").update({
+        status: "done",
+        entities_found: 0,
+        completed_at: new Date().toISOString(),
+      }).eq("id", doc.id);
+      await service.from("uploads").update({ status: "done" }).eq("id", uploadId);
+      return NextResponse.json({ upload_id: uploadId, inserted: 0, status: "done" });
+    }
+
     await service.from("source_documents").update({ status: "deduplicating" }).eq("id", doc.id);
 
-    const { data: existingContacts } = await service
-      .from("contacts")
-      .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
-      .eq("is_duplicate", false);
+    // ── Fast DB-level exact dedup (no in-memory fuzzy scan) ────────────────
+    // Collect all emails and phones from the new batch
+    const newEmails = normalizedContacts.map(c => c.email).filter((e): e is string => !!e);
+    const newPhones = normalizedContacts.map(c => c.phone).filter((p): p is string => !!p);
 
-    const existing = (existingContacts ?? []) as Contact[];
+    // Single indexed query — find any existing contacts that share an email or phone
+    const matchQueries: Promise<{ data: Contact[] | null }>[] = [];
+
+    if (newEmails.length > 0) {
+      matchQueries.push(
+        service
+          .from("contacts")
+          .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
+          .in("email", newEmails)
+          .eq("is_duplicate", false) as unknown as Promise<{ data: Contact[] | null }>
+      );
+    }
+    if (newPhones.length > 0) {
+      matchQueries.push(
+        service
+          .from("contacts")
+          .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
+          .in("phone", newPhones)
+          .eq("is_duplicate", false) as unknown as Promise<{ data: Contact[] | null }>
+      );
+    }
+
+    const matchResults = await Promise.all(matchQueries);
+    const existingMap = new Map<string, Contact>();
+    for (const res of matchResults) {
+      for (const c of (res.data ?? []) as Contact[]) {
+        existingMap.set(c.id, c);
+      }
+    }
+
+    // Build fast lookup maps: email → contact, phone → contact
+    const byEmail = new Map<string, Contact>();
+    const byPhone = new Map<string, Contact>();
+    for (const c of existingMap.values()) {
+      if (c.email) byEmail.set(c.email, c);
+      if (c.email_alt) byEmail.set(c.email_alt, c);
+      if (c.phone) byPhone.set(c.phone, c);
+    }
+
     let inserted = 0;
-    const dupPairs: { a: string; b: string; score: number; reasons: string[] }[] = [];
 
     for (const contact of normalizedContacts) {
-      const matches = findDuplicates(
-        {
-          email: contact.email ?? undefined,
-          phone: contact.phone ?? undefined,
-          full_name: contact.full_name ?? undefined,
-          country: contact.country ?? undefined,
-          confidence_score: contact.confidence_score ?? 0.5,
-          flags: contact.flags ?? [],
-          extraction_method: "deterministic",
-        },
-        existing
-      );
+      // Exact email match → merge
+      const emailMatch = contact.email ? byEmail.get(contact.email) : undefined;
+      // Exact phone match → merge (only if no email match)
+      const phoneMatch = !emailMatch && contact.phone ? byPhone.get(contact.phone) : undefined;
+      const match = emailMatch ?? phoneMatch;
 
-      const topMatch = matches[0];
-
-      if (topMatch && topMatch.score >= 0.9) {
-        const existingContact = existing.find((c) => c.id === topMatch.contact_id);
-        if (existingContact) {
-          const merged = mergeContacts(existingContact, contact as Contact);
-          await service.from("contacts").update(merged).eq("id", existingContact.id);
-          Object.assign(existingContact, merged);
-          inserted++;
-          continue;
-        }
+      if (match) {
+        const merged = mergeContacts(match, contact as Contact);
+        await service.from("contacts").update(merged).eq("id", match.id);
+        // Update local maps so subsequent contacts in this batch see the merge
+        if (merged.email) byEmail.set(merged.email, { ...match, ...merged });
+        if (merged.phone) byPhone.set(merged.phone, { ...match, ...merged });
+        inserted++;
+        continue;
       }
 
-      const contactToInsert = { ...contact };
-
-      if (topMatch && topMatch.score >= 0.7) {
-        contactToInsert.is_flagged = true;
-        contactToInsert.flags = [...(contactToInsert.flags ?? []), "potential_duplicate"];
-      }
-
+      // No exact match → insert as new
       const { data: newContact, error: insertErr } = await service
         .from("contacts")
-        .insert(contactToInsert)
-        .select("id")
+        .insert(contact)
+        .select("id, email, phone")
         .single();
 
       if (insertErr || !newContact) continue;
       inserted++;
 
-      if (topMatch && topMatch.score >= 0.7) {
-        dupPairs.push({
-          a: topMatch.contact_id,
-          b: newContact.id,
-          score: topMatch.score,
-          reasons: topMatch.reasons,
-        });
-      }
-
-      existing.push({
-        ...contactToInsert,
-        id: newContact.id,
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      } as Contact);
-    }
-
-    if (dupPairs.length > 0) {
-      await service.from("duplicate_candidates").insert(
-        dupPairs.map((p) => ({
-          contact_a: p.a,
-          contact_b: p.b,
-          match_score: p.score,
-          match_reasons: p.reasons,
-          status: "pending",
-        }))
-      );
+      // Add to local maps so rest of batch can dedup against it
+      if (newContact.email) byEmail.set(newContact.email, { ...contact, id: newContact.id } as Contact);
+      if (newContact.phone) byPhone.set(newContact.phone, { ...contact, id: newContact.id } as Contact);
     }
 
     await service.from("source_documents").update({
@@ -163,8 +165,8 @@ export async function POST(
       source_document_id: doc.id,
       stage: "deduplicate",
       status: "success",
-      message: `Inserted ${inserted} contacts, ${dupPairs.length} duplicate pairs flagged`,
-      metadata: { inserted, dup_pairs: dupPairs.length },
+      message: `Inserted/merged ${inserted} contacts`,
+      metadata: { inserted },
     });
 
     return NextResponse.json({ upload_id: uploadId, document_id: doc.id, inserted, status: "done" });
