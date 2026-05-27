@@ -84,7 +84,7 @@ export function UploadZone() {
           prev.map((item, idx) => (idx === i ? { ...item, progress: 40 } : item))
         );
 
-        // 2. Trigger processing via API
+        // 2. Register upload record (returns immediately)
         const response = await fetch("/api/upload", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -98,8 +98,10 @@ export function UploadZone() {
 
         if (!response.ok) {
           const err = await response.json();
-          throw new Error(err.error ?? "Processing failed");
+          throw new Error(err.error ?? "Registration failed");
         }
+
+        const { upload_id } = await response.json();
 
         setFiles((prev) =>
           prev.map((item, idx) =>
@@ -111,6 +113,9 @@ export function UploadZone() {
           title: "Queued for processing",
           description: `${f.file.name} is in the pipeline.`,
         });
+
+        // 3. Fire-and-forget extraction (don't block UI)
+        fetch(`/api/process/${upload_id}`, { method: "POST" }).catch(() => {});
       } catch (err) {
         const message = err instanceof Error ? err.message : "Upload failed";
         setFiles((prev) =>

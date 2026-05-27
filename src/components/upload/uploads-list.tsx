@@ -8,12 +8,23 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 import { fileTypeIcon, formatBytes, formatDate, statusVariant } from "@/lib/utils";
+import { Loader2, RotateCcw } from "lucide-react";
 import type { Upload } from "@/types";
 
 export function UploadsList() {
   const supabase = createClient();
   const [uploads, setUploads] = useState<Upload[]>([]);
   const [loading, setLoading] = useState(true);
+  const [retrying, setRetrying] = useState<Set<string>>(new Set());
+
+  async function reprocess(uploadId: string) {
+    setRetrying((prev) => new Set(prev).add(uploadId));
+    try {
+      await fetch(`/api/process/${uploadId}`, { method: "POST" });
+    } finally {
+      setRetrying((prev) => { const s = new Set(prev); s.delete(uploadId); return s; });
+    }
+  }
 
   useEffect(() => {
     async function fetchUploads() {
@@ -51,20 +62,21 @@ export function UploadsList() {
               <TableHead>Size</TableHead>
               <TableHead>Status</TableHead>
               <TableHead>Uploaded</TableHead>
+              <TableHead />
             </TableRow>
           </TableHeader>
           <TableBody>
             {loading ? (
               Array.from({ length: 5 }).map((_, i) => (
                 <TableRow key={i}>
-                  {Array.from({ length: 5 }).map((_, j) => (
+                  {Array.from({ length: 6 }).map((_, j) => (
                     <TableCell key={j}><Skeleton className="h-4 w-full" /></TableCell>
                   ))}
                 </TableRow>
               ))
             ) : uploads.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={5} className="text-center py-10 text-sm text-muted-foreground">
+                <TableCell colSpan={6} className="text-center py-10 text-sm text-muted-foreground">
                   No uploads yet
                 </TableCell>
               </TableRow>
@@ -88,6 +100,20 @@ export function UploadsList() {
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {formatDate(u.created_at)}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    {(u.status === "queued" || u.status === "processing" || u.status === "failed") && (
+                      <button
+                        onClick={() => reprocess(u.id)}
+                        disabled={retrying.has(u.id)}
+                        title="Reprocess"
+                        className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground disabled:opacity-50 transition-colors"
+                      >
+                        {retrying.has(u.id)
+                          ? <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          : <RotateCcw className="h-3.5 w-3.5" />}
+                      </button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))
