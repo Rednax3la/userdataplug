@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient, createServiceClient } from "@/lib/supabase/server";
-import { runExtractionPipeline, normalizeEntities } from "@/lib/extraction/pipeline";
+import { runExtractionPipeline } from "@/lib/extraction/pipeline";
 import { mergeContacts } from "@/lib/extraction/deduplicator";
 import type { Contact } from "@/types";
 
@@ -26,10 +26,7 @@ export async function POST(
     .single();
 
   if (!upload) return NextResponse.json({ error: "Upload not found" }, { status: 404 });
-
-  if (upload.status === "done") {
-    return NextResponse.json({ status: "done" });
-  }
+  if (upload.status === "done") return NextResponse.json({ status: "done" });
 
   const { data: doc } = await service
     .from("source_documents")
@@ -45,7 +42,7 @@ export async function POST(
   ]);
 
   try {
-    // Download file
+    // 1. Download file
     const { data: fileData, error: dlError } = await service.storage
       .from("uploads")
       .download(upload.storage_path);
@@ -56,6 +53,7 @@ export async function POST(
 
     await service.from("source_documents").update({ status: "extracting" }).eq("id", doc.id);
 
+    // 2. Extract contacts
     const normalizedContacts = await runExtractionPipeline(
       buffer,
       upload.file_type,
@@ -64,129 +62,126 @@ export async function POST(
     );
 
     if (normalizedContacts.length === 0) {
-      await service.from("source_documents").update({
-        status: "done",
-        entities_found: 0,
-        completed_at: new Date().toISOString(),
-      }).eq("id", doc.id);
-      await service.from("uploads").update({ status: "done" }).eq("id", uploadId);
+      await Promise.all([
+        service.from("source_documents").update({
+          status: "done", entities_found: 0, completed_at: new Date().toISOString(),
+        }).eq("id", doc.id),
+        service.from("uploads").update({ status: "done" }).eq("id", uploadId),
+      ]);
       return NextResponse.json({ upload_id: uploadId, inserted: 0, status: "done" });
     }
 
     await service.from("source_documents").update({ status: "deduplicating" }).eq("id", doc.id);
 
-    // ── Fast DB-level exact dedup (no in-memory fuzzy scan) ────────────────
-    // Collect all emails and phones from the new batch
+    // 3. Single DB query to find all existing contacts that share an email or phone
     const newEmails = normalizedContacts.map(c => c.email).filter((e): e is string => !!e);
     const newPhones = normalizedContacts.map(c => c.phone).filter((p): p is string => !!p);
 
-    // Single indexed query — find any existing contacts that share an email or phone
-    const matchQueries: Promise<{ data: Contact[] | null }>[] = [];
+    const [emailMatches, phoneMatches] = await Promise.all([
+      newEmails.length > 0
+        ? service.from("contacts")
+            .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
+            .in("email", newEmails)
+            .eq("is_duplicate", false)
+        : Promise.resolve({ data: [] }),
+      newPhones.length > 0
+        ? service.from("contacts")
+            .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
+            .in("phone", newPhones)
+            .eq("is_duplicate", false)
+        : Promise.resolve({ data: [] }),
+    ]);
 
-    if (newEmails.length > 0) {
-      matchQueries.push(
-        service
-          .from("contacts")
-          .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
-          .in("email", newEmails)
-          .eq("is_duplicate", false) as unknown as Promise<{ data: Contact[] | null }>
-      );
-    }
-    if (newPhones.length > 0) {
-      matchQueries.push(
-        service
-          .from("contacts")
-          .select("id, email, email_alt, phone, full_name, country, confidence_score, primary_source_id, all_source_ids, merged_from, field_sources")
-          .in("phone", newPhones)
-          .eq("is_duplicate", false) as unknown as Promise<{ data: Contact[] | null }>
-      );
-    }
-
-    const matchResults = await Promise.all(matchQueries);
-    const existingMap = new Map<string, Contact>();
-    for (const res of matchResults) {
-      for (const c of (res.data ?? []) as Contact[]) {
-        existingMap.set(c.id, c);
-      }
-    }
-
-    // Build fast lookup maps: email → contact, phone → contact
+    // Build O(1) lookup maps
     const byEmail = new Map<string, Contact>();
     const byPhone = new Map<string, Contact>();
-    for (const c of existingMap.values()) {
+    for (const c of [...(emailMatches.data ?? []), ...(phoneMatches.data ?? [])] as Contact[]) {
       if (c.email) byEmail.set(c.email, c);
       if (c.email_alt) byEmail.set(c.email_alt, c);
       if (c.phone) byPhone.set(c.phone, c);
     }
 
-    let inserted = 0;
+    // 4. Split into: contacts to merge into existing vs contacts to insert fresh
+    const toInsert: typeof normalizedContacts = [];
+    const toMerge: { existingId: string; merged: Partial<Contact> }[] = [];
 
     for (const contact of normalizedContacts) {
-      // Exact email match → merge
-      const emailMatch = contact.email ? byEmail.get(contact.email) : undefined;
-      // Exact phone match → merge (only if no email match)
-      const phoneMatch = !emailMatch && contact.phone ? byPhone.get(contact.phone) : undefined;
-      const match = emailMatch ?? phoneMatch;
+      const match =
+        (contact.email ? byEmail.get(contact.email) : undefined) ??
+        (contact.phone ? byPhone.get(contact.phone) : undefined);
 
       if (match) {
-        const merged = mergeContacts(match, contact as Contact);
-        await service.from("contacts").update(merged).eq("id", match.id);
-        // Update local maps so subsequent contacts in this batch see the merge
-        if (merged.email) byEmail.set(merged.email, { ...match, ...merged });
-        if (merged.phone) byPhone.set(merged.phone, { ...match, ...merged });
-        inserted++;
-        continue;
+        toMerge.push({ existingId: match.id, merged: mergeContacts(match, contact as Contact) });
+      } else {
+        toInsert.push(contact);
+        // Register in local maps so duplicates within this batch are caught too
+        if (contact.email) byEmail.set(contact.email, contact as unknown as Contact);
+        if (contact.phone) byPhone.set(contact.phone, contact as unknown as Contact);
       }
-
-      // No exact match → insert as new
-      const { data: newContact, error: insertErr } = await service
-        .from("contacts")
-        .insert(contact)
-        .select("id, email, phone")
-        .single();
-
-      if (insertErr || !newContact) continue;
-      inserted++;
-
-      // Add to local maps so rest of batch can dedup against it
-      if (newContact.email) byEmail.set(newContact.email, { ...contact, id: newContact.id } as Contact);
-      if (newContact.phone) byPhone.set(newContact.phone, { ...contact, id: newContact.id } as Contact);
     }
 
-    await service.from("source_documents").update({
+    // 5. Batch insert all new contacts in ONE call (huge speedup vs per-row inserts)
+    let insertedCount = toMerge.length; // merges count as processed
+    if (toInsert.length > 0) {
+      // Supabase has a ~1000 row limit per insert; chunk if needed
+      const CHUNK = 500;
+      for (let i = 0; i < toInsert.length; i += CHUNK) {
+        const chunk = toInsert.slice(i, i + CHUNK);
+        const { error } = await service.from("contacts").insert(chunk);
+        if (!error) insertedCount += chunk.length;
+      }
+    }
+
+    // 6. Apply merges in parallel (typically few; most contacts are net-new)
+    if (toMerge.length > 0) {
+      await Promise.all(
+        toMerge.map(({ existingId, merged }) =>
+          service.from("contacts").update(merged).eq("id", existingId)
+        )
+      );
+    }
+
+    // 7. Mark done
+    await Promise.all([
+      service.from("source_documents").update({
+        status: "done",
+        entities_found: insertedCount,
+        completed_at: new Date().toISOString(),
+      }).eq("id", doc.id),
+      service.from("uploads").update({ status: "done" }).eq("id", uploadId),
+      service.from("processing_logs").insert({
+        source_document_id: doc.id,
+        stage: "deduplicate",
+        status: "success",
+        message: `Inserted ${toInsert.length} new contacts, merged ${toMerge.length}`,
+        metadata: { inserted: toInsert.length, merged: toMerge.length },
+      }),
+    ]);
+
+    return NextResponse.json({
+      upload_id: uploadId,
+      document_id: doc.id,
+      inserted: toInsert.length,
+      merged: toMerge.length,
       status: "done",
-      entities_found: inserted,
-      completed_at: new Date().toISOString(),
-    }).eq("id", doc.id);
-
-    await service.from("uploads").update({ status: "done" }).eq("id", uploadId);
-
-    await service.from("processing_logs").insert({
-      source_document_id: doc.id,
-      stage: "deduplicate",
-      status: "success",
-      message: `Inserted/merged ${inserted} contacts`,
-      metadata: { inserted },
     });
-
-    return NextResponse.json({ upload_id: uploadId, document_id: doc.id, inserted, status: "done" });
 
   } catch (err) {
     const message = err instanceof Error ? err.message : "Extraction failed";
 
-    await service.from("source_documents").update({
-      status: "failed",
-      error_message: message,
-    }).eq("id", doc.id);
-
-    await service.from("uploads").update({ status: "failed" }).eq("id", uploadId);
-
-    await service.from("processing_logs").insert({
-      source_document_id: doc.id,
-      stage: "extract",
-      status: "error",
-      message,
-    });
+    await Promise.all([
+      service.from("source_documents").update({
+        status: "failed",
+        error_message: message,
+      }).eq("id", doc.id),
+      service.from("uploads").update({ status: "failed" }).eq("id", uploadId),
+      service.from("processing_logs").insert({
+        source_document_id: doc.id,
+        stage: "extract",
+        status: "error",
+        message,
+      }),
+    ]);
 
     return NextResponse.json({ error: message }, { status: 500 });
   }
