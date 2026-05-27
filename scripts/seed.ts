@@ -26,6 +26,7 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 const DATA_DIR = path.join(__dirname, "../../Userdata/Combined batch data");
+const ADANTA_PATH = path.join(__dirname, "../../Userdata/Adanta Customer Database.xlsx");
 
 if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
   console.error("❌  Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env.local");
@@ -409,6 +410,124 @@ async function alreadyExists(email: string | null, phone: string | null): Promis
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
+async function seedAdanta(): Promise<{ inserted: number; merged: number }> {
+  if (!fs.existsSync(ADANTA_PATH)) {
+    console.log("⚠️   Adanta Customer Database.xlsx not found at", ADANTA_PATH);
+    return { inserted: 0, merged: 0 };
+  }
+
+  process.stdout.write("📋  Seeding Adanta Customer Database.xlsx... ");
+  const buf = fs.readFileSync(ADANTA_PATH);
+  const wb = XLSX.read(buf, { type: "buffer" });
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows: Record<string, string>[] = XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+  // Upsert source doc
+  const { data: existingDoc } = await supabase
+    .from("source_documents").select("id").eq("file_name", "Adanta Customer Database.xlsx").maybeSingle();
+  let docId: string;
+  if (existingDoc) {
+    docId = existingDoc.id as string;
+  } else {
+    const { data: d } = await supabase.from("source_documents").insert({
+      upload_id: null,
+      file_name: "Adanta Customer Database.xlsx",
+      file_path: "local/Adanta Customer Database.xlsx",
+      file_type: "xlsx",
+      file_size: buf.length,
+      status: "parsing",
+    }).select("id").single();
+    if (!d) { console.log("doc insert failed"); return { inserted: 0, merged: 0 }; }
+    docId = d.id as string;
+  }
+
+  // Known columns: email, email_alt, phone, fn (first), ln (last), gender, country
+  // Detect columns case-insensitively
+  const sampleRow = rows[0] ?? {};
+  const colMap: Record<string, string> = {};
+  for (const key of Object.keys(sampleRow)) {
+    const k = key.toLowerCase().trim();
+    if (k === "email") colMap["email"] = key;
+    else if (k === "email_alt" || k === "email alt") colMap["email_alt"] = key;
+    else if (k === "phone" || k === "mobile" || k === "telephone") colMap["phone"] = key;
+    else if (k === "fn" || k === "first_name" || k === "first name" || k === "firstname") colMap["first_name"] = key;
+    else if (k === "ln" || k === "last_name" || k === "last name" || k === "lastname" || k === "surname") colMap["last_name"] = key;
+    else if (k === "gender" || k === "sex") colMap["gender"] = key;
+    else if (k === "country" || k === "nationality") colMap["country"] = key;
+    else if (k === "name" || k === "full_name" || k === "full name") colMap["full_name"] = key;
+    else if (k === "city" || k === "town") colMap["city"] = key;
+    else if (k === "company" || k === "organisation" || k === "organization") colMap["company"] = key;
+    else if (k === "role" || k === "title" || k === "position") colMap["role"] = key;
+  }
+
+  let inserted = 0;
+  let merged = 0;
+
+  for (const row of rows) {
+    const get = (field: string) => colMap[field] ? String(row[colMap[field]] ?? "").trim() : "";
+
+    const email = normalizeEmail(get("email"));
+    const emailAlt = normalizeEmail(get("email_alt"));
+    const phone = normalizePhone(get("phone"));
+    const firstName = get("first_name") || null;
+    const lastName = get("last_name") || null;
+    const fullName = get("full_name") || (firstName && lastName ? `${firstName} ${lastName}` : firstName ?? lastName ?? null);
+    const rawGender = get("gender").toUpperCase();
+    const gender = rawGender.startsWith("F") ? "F" : rawGender.startsWith("M") ? "M" : null;
+    const country = normalizeCountry(get("country"));
+    const city = get("city") || null;
+    const company = get("company") || null;
+    const role = get("role") || null;
+
+    if (!email && !emailAlt && !phone && !fullName) continue;
+
+    const existingId = await alreadyExists(email, phone) ?? await alreadyExists(emailAlt, null);
+
+    if (existingId) {
+      const update: Record<string, unknown> = {};
+      const { data: curr } = await supabase
+        .from("contacts")
+        .select("full_name,first_name,last_name,gender,country,city,company,role,email_alt,all_source_ids")
+        .eq("id", existingId).maybeSingle();
+      if (curr) {
+        const c = curr as Record<string, unknown>;
+        if (!c.full_name && fullName) update.full_name = fullName;
+        if (!c.first_name && firstName) update.first_name = firstName;
+        if (!c.last_name && lastName) update.last_name = lastName;
+        if (!c.gender && gender) update.gender = gender;
+        if (!c.country && country) update.country = country;
+        if (!c.city && city) update.city = city;
+        if (!c.company && company) update.company = company;
+        if (!c.role && role) update.role = role;
+        if (!c.email_alt && emailAlt) update.email_alt = emailAlt;
+        const sourceIds = [...new Set([...((c.all_source_ids as string[]) ?? []), docId])];
+        update.all_source_ids = sourceIds;
+        if (Object.keys(update).length > 1) {
+          await supabase.from("contacts").update(update).eq("id", existingId);
+        }
+      }
+      merged++;
+    } else {
+      const { error } = await supabase.from("contacts").insert({
+        email, email_alt: emailAlt, phone, phone_raw: get("phone") || null,
+        first_name: firstName, last_name: lastName, full_name: fullName,
+        gender, country, city, company, role,
+        confidence_score: email ? 0.9 : phone ? 0.8 : 0.6,
+        primary_source_id: docId, all_source_ids: [docId],
+        is_duplicate: false, is_flagged: false, opted_out: false, flags: ["adanta"],
+      });
+      if (!error) inserted++;
+    }
+  }
+
+  await supabase.from("source_documents").update({
+    status: "done", entities_found: inserted + merged, completed_at: new Date().toISOString(),
+  }).eq("id", docId);
+
+  console.log(`${inserted} inserted, ${merged} merged`);
+  return { inserted, merged };
+}
+
 async function main() {
   console.log("🔍  Scanning:", DATA_DIR);
 
@@ -417,16 +536,19 @@ async function main() {
     process.exit(1);
   }
 
+  // Seed Adanta database first (highest-quality data)
+  const adanta = await seedAdanta();
+
   const allFiles = fs.readdirSync(DATA_DIR).filter((f) => {
     const ext = path.extname(f).toLowerCase();
     return [".pdf", ".xls", ".xlsx", ".csv", ".docx"].includes(ext);
   });
 
   console.log(`📁  Found ${allFiles.length} files to process`);
-  console.log(`🤖  AI extraction: ${ANTHROPIC_API_KEY ? "ENABLED (all files without structured data)" : "DISABLED"}\n`);
+  console.log(`🤖  AI extraction: ${ANTHROPIC_API_KEY ? "ENABLED" : "DISABLED"}\n`);
 
-  let totalInserted = 0;
-  let totalMerged = 0;
+  let totalInserted = adanta.inserted;
+  let totalMerged = adanta.merged;
   let aiUsed = 0;
   let filesDone = 0;
 
