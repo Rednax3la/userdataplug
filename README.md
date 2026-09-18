@@ -116,3 +116,7 @@ See [docs/deployment.md](docs/deployment.md) for full deployment instructions.
 ## License
 
 Private. All rights reserved.
+
+## Verification
+
+Run `npm test` for export pagination, CSV/Excel/Meta response, authentication, and extraction regression tests. Run `npx tsc --noEmit --incremental false` and `npm run build` for application checks. Tests use synthetic contacts and do not modify the database.

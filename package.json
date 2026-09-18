@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
+    "test": "node --import tsx --test scripts/export.test.ts scripts/export-route.test.ts scripts/extraction.test.ts",
     "seed": "tsx scripts/seed.ts",
     "seed:force": "tsx scripts/seed.ts --force"
   },

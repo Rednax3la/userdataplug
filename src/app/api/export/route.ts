@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import type { Contact } from "@/types";
+import { fetchAllRows } from "@/lib/supabase/pagination";
 
 // CSV helpers
 function escapeCSV(val: unknown): string {
@@ -33,7 +34,8 @@ export async function GET(req: NextRequest) {
     .from("contacts")
     .select("*")
     .eq("is_duplicate", false)
-    .order("created_at", { ascending: false });
+    .order("created_at", { ascending: false })
+    .order("id", { ascending: false });
 
   if (excludeOptedOut) query = query.eq("opted_out", false);
   if (minConfidence > 0) query = query.gte("confidence_score", minConfidence);
@@ -45,8 +47,8 @@ export async function GET(req: NextRequest) {
   else if (hasFilter === "email_only") query = query.not("email", "is", null).is("phone", null);
   else if (hasFilter === "phone_only") query = query.is("email", null).not("phone", "is", null);
 
-  // Stream all records (max 100k)
-  const { data, error } = await query.limit(100000);
+  // Fetch every page; a large limit cannot override the database response cap.
+  const { data, error } = await fetchAllRows<Contact>((from, to) => query.range(from, to));
   if (error) return NextResponse.json({ error: error.message }, { status: 500 });
 
   const contacts = (data ?? []) as Contact[];
